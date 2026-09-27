@@ -1,6 +1,6 @@
 # Roadmap: Learning Deep Learning by Building a Connectome Controller
 
-A staged learning plan. The end goal is a robot policy whose action decoder is the fruit fly's real neural wiring, compared fairly against a conventional one. The real goal along the way is to actually understand deep learning and robot learning, rather than gluing repos together.
+A staged learning plan. The end goal is a VLA robot policy whose action decoder is the fruit fly's real ventral nerve cord wiring (from MaleCNS), compared fairly against a conventional decoder. The real goal along the way is to actually understand deep learning and robot learning, rather than gluing repos together.
 
 Background on the connectome and the existing projects: [connectome-projects.md](./connectome-projects.md).
 
@@ -11,6 +11,69 @@ Background on the connectome and the existing projects: [connectome-projects.md]
 > Does a sparse connection pattern that evolution selected for sensorimotor control work better, as a neural network architecture, than a generic one of the same size?
 
 Not "can I make a fly brain play a game." That has been done many times and, as §5 of the survey covers, it demonstrates nothing. The question above is narrow, testable, and can come out "no" — which is what makes it worth doing.
+
+---
+
+## What I'm actually building: one module, the VNC action head
+
+Every stage below builds, tests, or uses **one component**: an action head made from the **ventral nerve cord (VNC)** part of MaleCNS. The VNC is the fly's "spinal cord." It receives commands from the brain through **descending neurons** and drives the muscles through **motor neurons**. MaleCNS is the first connectome that includes it, so this is the part that makes the project possible.
+
+In the final VLA, the head sits here:
+
+```
+image + instruction ──▶ frozen VLM ──▶ cached feature vector      [B, d]
+                                             │
+                               Linear (learned)                    "intent" → descending neurons
+                                             │
+                              drive on descending neurons          [B, N_DN]
+                                             │
+                  VNC subgraph: sparse signed W, run T recurrent steps
+                                             │
+                              motor neuron activity                [B, N_MN]
+                                             │
+                               Linear (learned)                    motor neurons → robot joints
+                                             │
+                                          actions                  [B, action_dim]
+```
+
+**What is fixed vs. learned:**
+
+| Part | Source | Trained? |
+|---|---|---|
+| VLM | pretrained | no (frozen, features cached) |
+| Input projection | — | yes |
+| Which VNC edges exist, and their sign | MaleCNS | **no** — this is the biology being tested |
+| Edge magnitudes, thresholds, time constants (or a per-neuron embedding) | unknown biology | yes |
+| Output readout | — | yes |
+
+**Why it's "RNN-like."** A normal action head (an MLP) has layers: layer 1 → layer 2 → layer 3, no loops. The VNC has no layers. A can drive B, B drives C, C drives A again, so no order exists in which each neuron can be computed once. Instead I inject the input and apply the same update `T` times, letting activity spread one synapse further each step, then read the motor neurons. That loop is structurally an RNN unrolled for `T` steps. "VNC action head" is the *role*; "sparse RNN" is *how it's computed*. They are the same thing.
+
+**Nuance: `T` is not episode time.** The `T` steps are internal settling steps inside **one** control step: one camera frame in, `T` steps of dynamics, one action out. Whether the voltage `v` carries over from one frame to the next (a stateful head) is a separate choice. Default: reset every frame, because it's simpler to debug; revisit if the task needs memory.
+
+**The same class is used at every stage; only the subgraph and the I/O change:**
+
+| Stage | Subgraph loaded | Input → | → Output | Purpose |
+|---|---|---|---|---|
+| 1 | full 166k graph, plus a few subgraph sizes | random drive | random readout | measure speed; nothing is learned |
+| 2 | small subgraph | fixed pattern | fixed target | prove gradients flow |
+| 3–4 | **VNC** | fly body state + command (target speed / heading) → descending neurons | motor neurons → fly joints | **the real experiment** |
+| 5 | **VNC** | VLM features → descending neurons | motor neurons → robot joints | the VLA action head |
+
+Stages 3–5 use the same VNC module, so a result at stage 3 carries directly into stage 5. The rewired baseline is the same class with `W`'s edges shuffled.
+
+---
+
+## Why not use the whole 166k-neuron graph as the VLA?
+
+The full graph *can* be wired in. It can't be the *whole* VLA, because a VLA's ability comes mostly from its pretrained vision-language model, and the fly brain supplies none of that.
+
+1. **No language.** The fly has no neurons that process language, so nothing in the graph can read "put the red mug in the sink." A text encoder is needed anyway, and once it exists I'm back to "conventional model + connectome." The only open question is *where* its vector gets injected.
+2. **Fly vision solves a different problem.** The optic lobe is built for two compound eyes with roughly 700–800 facets each and is tuned for motion, looming, and optic flow — dodging a swatter. Manipulation needs object identity and precise position ("which one is the mug, where is its handle"). There's also no natural mapping from a 224×224 RGB camera to the fly's hexagonal facet grid. The best evidence for connectome models (flyvis) covers motion detection, not recognizing objects.
+3. **Pretraining, not architecture, is what makes VLAs work.** OpenVLA's backbone is pretrained on internet-scale image+text data before seeing any robot data. A connectome starts with every trainable magnitude untrained and only robot demos to learn from (OpenVLA's robot dataset alone is ~1M episodes, and it still relies on pretraining to generalize). A from-scratch connectome would at best learn the training tasks, like the Beat Saber fly, and generalize poorly to new instructions or scenes.
+4. **The experiment stops being interpretable.** If only the action head changes, a connectome-vs-rewired difference is attributable to the wiring. If the whole model changes, vision, language, capacity, and pretraining all change at once, and no result can be attributed to anything.
+5. **Compute (the smallest reason).** Backprop through 25.6M edges × 50 steps per frame is expensive but not impossible; stage 1's benchmark gives the real number. Even with unlimited compute, reasons 1–4 still hold.
+
+**So the VNC-only head is the starting point, not the ceiling.** It's the smallest version that tests the question cleanly. More of the graph gets added in [Future work](#future-work-growing-toward-the-full-graph), one step at a time, keeping the rewired control at every step.
 
 ---
 
@@ -58,27 +121,39 @@ Stage 3 is the one that matters. Stages 0–2 exist so that a failure at stage 3
 
 **Goal:** one module, one number.
 
-**What I'm building:** a `MaleCNSLayer` — the connectome as a sparse signed adjacency matrix that runs as a dynamical system over time.
+**What I'm building:** a `MaleCNSLayer`, the core of the VNC action head described above. It takes **any subgraph** (a list of neurons, plus which ones receive input and which are read out), so the same class serves every stage.
 
 ```python
 class MaleCNSLayer(nn.Module):
-    # W: sparse [N, N]. Entry (u,v) = N_exc(u,v) - N_inh(u,v),
-    # i.e. excitatory minus inhibitory synapse counts, sign from
-    # the predicted neurotransmitter of the presynaptic neuron.
+    """Sparse recurrent layer over a connectome subgraph.
+
+    W:       sparse [N, N]. Entry (u,v) = N_exc(u,v) - N_inh(u,v),
+             i.e. excitatory minus inhibitory synapse counts, sign from
+             the predicted neurotransmitter of the presynaptic neuron.
+    in_idx:  neurons that receive input (descending neurons in the VLA).
+    out_idx: neurons that are read out (motor neurons in the VLA).
+    """
     def forward(self, drive, T=50):
-        v = torch.zeros(N)          # membrane voltage
-        act = torch.zeros(N)        # activity (firing rate)
-        for t in range(T):
-            v = self.decay * v + torch.sparse.mm(self.W, act) + drive
+        # drive: [B, len(in_idx)], already projected by a learned Linear
+        B = drive.shape[0]
+        v = drive.new_zeros(B, N)       # membrane voltage
+        act = drive.new_zeros(B, N)     # activity (firing rate)
+        inject = drive.new_zeros(B, N)
+        inject[:, self.in_idx] = drive  # input only enters at in_idx
+        for t in range(T):              # T settling steps, not episode time
+            v = self.decay * v + torch.sparse.mm(self.W, act.T).T + inject
             act = F.relu(v - self.threshold)
-        return act[self.efferent_idx]   # read out motor neurons
+        return act[:, self.out_idx]     # [B, len(out_idx)]
 ```
+
+`torch.sparse.mm` needs the sparse matrix on the left, so the batch `[B, N]` is transposed to `[N, B]` and back.
 
 **Concepts I'll meet here:**
 
 - **Sparsity.** Dense, 166,700² floats is ~111 GB. Sparse, storing only the ~25.6M real edges, is ~300 MB. This is not an optimization, it's the difference between possible and impossible.
 - **Recurrence.** There are no layers. The graph is full of loops, so there's no "forward order" — I run the same update `T` times and read the answer out at the end. This is structurally an RNN.
-- **Afferent / intrinsic / efferent.** The three roles neurons play in the model: sensory input, internal processing, motor output. I have to *choose* which real neurons fill each role, and that choice is a modeling decision I should write down and defend.
+- **Afferent / intrinsic / efferent.** The three roles neurons play in the model: input, internal processing, output. For the VNC head the default is **descending neurons = afferent** (`in_idx`), **motor neurons = efferent** (`out_idx`), everything else in the VNC = intrinsic. That's still a choice (e.g. the real VNC also receives leg sensory input, which I'm leaving out at first), so I write it down and defend it.
+- **Full graph vs. subgraph.** The full 166k graph is only for the stage-1 benchmark. The model I actually train from stage 3 onward is the VNC slice.
 
 **Write the baseline on day one, before I have any results to be attached to:**
 
@@ -120,7 +195,7 @@ Fifty recurrent steps is deep. Gradients passing back through fifty multiplicati
 
 **Goal:** answer the question at the top of this file.
 
-**Setup:** connectome policy → simulated fly body → walking, trained by **behavior cloning** (supervised learning on recorded expert trajectories: "given this state, output the action the expert did"). No reinforcement learning yet — supervised learning is far easier to debug, and [FlyGM](https://arxiv.org/abs/2602.17997) itself starts this way before adding RL.
+**Setup:** the VNC head as a policy → simulated fly body → walking. Concretely: fly body state + a command (target speed / heading) → learned Linear → descending neurons → VNC, `T` steps → motor neurons → fly joints. This is the same module as the VLA head in stage 5; only the input source differs (body state here, VLM features there). Trained by **behavior cloning** (supervised learning on recorded expert trajectories: "given this state, output the action the expert did"). No reinforcement learning yet — supervised learning is far easier to debug, and [FlyGM](https://arxiv.org/abs/2602.17997) itself starts this way before adding RL.
 
 **Why a fly body and not a robot arm:** this is the one task where the connectome has a fair shot, because the brain and the body match — those descending neurons evolved to command six legs and wings. Point them at a 6-DoF arm and the anatomical argument disappears and I'm just using an oddly-shaped sparse matrix. Prove it works where it *should* work, then test transfer.
 
@@ -130,7 +205,7 @@ Use [flygym](https://github.com/NeLy-EPFL/flygym) (better sensory tooling) or [f
 
 | Arm | Wiring | Purpose |
 |---|---|---|
-| Connectome | real MaleCNS graph | the hypothesis |
+| Connectome | real MaleCNS VNC graph | the hypothesis |
 | Rewired | degree-preserving shuffle | **the control** — same statistics, wrong biology |
 | MLP | dense, parameter-matched | the conventional baseline |
 
@@ -166,9 +241,11 @@ Imitation only reproduces recorded behavior. RL learns from a reward signal by t
 
 **Goal:** the original idea, now with evidence behind it.
 
-A **VLA (Vision-Language-Action model)** maps a camera image plus an instruction to robot actions. It's a pretrained vision-language transformer with an action decoder bolted on. **The connectome replaces the action decoder only** — the part that's already small and already trained from scratch on robot data. The vision-language half stays conventional, because the connectome has no language and no internet-scale pretraining to offer.
+A **VLA (Vision-Language-Action model)** maps a camera image plus an instruction to robot actions. It's a pretrained vision-language transformer with an action decoder bolted on. **The VNC head from stages 3–4 replaces the action decoder only** — the part that's already small and already trained from scratch on robot data. The vision-language half stays conventional, because the connectome has no language and no internet-scale pretraining to offer. See the diagram in [What I'm actually building](#what-im-actually-building-one-module-the-vnc-action-head).
 
-This mirrors real fly anatomy: the brain sends a low-dimensional command down to the ventral nerve cord, which generates the actual motor pattern. MaleCNS is the first dataset that includes that nerve cord, which is exactly why this is newly possible.
+This mirrors real fly anatomy: the brain sends a low-dimensional command down to the ventral nerve cord, which generates the actual motor pattern. Here the VLM plays the brain and the VNC plays the VNC.
+
+**What changes from stage 3:** only the two Linear layers at the ends. The input projection now reads VLM features instead of fly body state, and the output readout maps motor neurons to robot joints instead of fly joints. That output mapping is where the anatomical argument weakens: fly motor neurons evolved for six legs and wings, not a 6-DoF arm. So stage 5 tests whether the VNC's structure helps *off* its native body, which stage 3 alone cannot show.
 
 **Two details that make the comparison fair:**
 1. **Freeze the vision-language model and cache its features.** Same frozen encoder for every arm; only the action head differs. Also makes training roughly 10× cheaper, since a 7B model isn't running every step.
@@ -177,6 +254,39 @@ This mirrors real fly anatomy: the brain sends a low-dimensional command down to
 **Benchmark:** a simulation suite like [LIBERO](https://github.com/Lifelong-Robot-Learning/LIBERO), not real hardware. Real robots add failure modes unrelated to my question. Reference implementation to compare against: [OpenVLA](https://github.com/openvla/openvla).
 
 **Deliverable:** `results/stage5.md` — success rate per arm, parameter counts, training cost.
+
+---
+
+## Future work: growing toward the full graph
+
+Only after stage 5 has a result, positive or negative. Each step adds one piece of the graph, so each result is attributable to that piece.
+
+### Inject higher up: brain + VNC action head
+
+**Question:** does the central brain's wiring add anything beyond the VNC?
+
+In stages 3–5 the VLM vector goes straight onto the descending neurons, skipping the brain entirely. Here it's injected into **central-brain neurons** instead, and activity has to travel through the brain, down the descending neurons, and through the VNC before reaching the motor neurons:
+
+```
+VLM features ──Linear──▶ central-brain neurons (e.g. central complex)
+                                │
+                  brain + VNC subgraph, T recurrent steps
+                  (descending neurons are now intrinsic, not the input)
+                                │
+                     motor neurons ──Linear──▶ actions
+```
+
+- **Same `MaleCNSLayer` class**, loaded with a bigger subgraph and a different `in_idx`. No new code beyond neuron selection.
+- **Candidate injection sites:** the **central complex** (the fly's navigation and heading hub, the closest match to "where to go") is the first choice. Picking the neurons is a modeling decision to document; use [connectome_interpreter](https://github.com/YijieYin/connectome_interpreter) to trace paths from candidate sites down to the descending neurons instead of guessing.
+- **`T` probably has to grow.** The signal now crosses more synapses before reaching the motor neurons, so 50 settling steps may not be enough for it to arrive. Measure how many steps it takes activity to reach `out_idx` before training.
+- **Arms:** brain+VNC connectome, brain+VNC rewired, **VNC-only connectome from stage 5**, and a parameter-matched MLP. The comparison that answers the question is brain+VNC vs. VNC-only; the rewired arm checks that any gain comes from the brain's *wiring*, not just from having more neurons.
+
+**Deliverable:** `results/future_brain_vnc.md` — success rate per arm, plus how `T` and compute changed.
+
+### Other directions (from the survey, §7)
+
+- **Optic lobe as the visual front end** (option B): connectome visual processing next to the VLM. Payoff is mostly efficiency (sparse, motion-tuned), not capability.
+- **Mushroom body as an adapter** (option C): freeze the policy and learn new task associations in a mushroom-body-shaped module. Most novel, highest risk.
 
 ---
 
@@ -196,7 +306,7 @@ This mirrors real fly anatomy: the brain sends a low-dimensional command down to
 docs/        connectome-projects.md, roadmap.md
 notebooks/   00_basics, 02_gradient_check  — exploration
 src/         malecns.py, baselines.py, policies.py  — real code
-results/     stage3.md, stage5.md  — findings, including negative ones
+results/     stage3.md, stage5.md, future_*.md  — findings, including negative ones
 ```
 
 Rule of thumb: notebooks are for looking at things, `src/` is for anything a result depends on.
